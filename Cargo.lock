@@ -370,6 +370,7 @@ dependencies = [
  "clap",
  "home",
  "log",
+ "percent-encoding",
  "pretty_env_logger",
  "reqwest",
  "serde",

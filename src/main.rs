@@ -1,6 +1,7 @@
 use clap::Parser;
 use home::home_dir;
 use log::{LevelFilter, debug, error, info, warn};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,7 +70,8 @@ impl Notifier for TelegramNotifier {
 }
 
 fn search_github(client: &Client, term: &str) -> Result<u64, reqwest::Error> {
-    let url = format!("https://api.github.com/search/code?q={}", term);
+    let encoded_term = utf8_percent_encode(term, NON_ALPHANUMERIC).to_string();
+    let url = format!("https://api.github.com/search/code?q={}", encoded_term);
     let mut rb = client.get(&url).header("User-Agent", "gh-alert");
     if let Ok(gh_token) = env::var("GH_TOKEN") {
         rb = rb.bearer_auth(gh_token);
@@ -102,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // --- 新增：检查 interval 参数 ---
-    let at_least = args.terms.len() as u64 * RATE_LIMIT_WINDOW_SECONDS / 10;
+    let at_least = args.terms.len() as u64 * RATE_LIMIT_WINDOW_SECONDS / REQUESTS_PER_MINUTE as u64;
     if args.interval < at_least {
         error!(
             "Error: The interval must be at lease {} for {} terms to respect the GitHub rate limit when monitoring multiple terms.",

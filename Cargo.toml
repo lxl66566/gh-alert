@@ -1,14 +1,15 @@
 [package]
-name = "gh-alert"
-version = "0.1.0"
 edition = "2024"
+name    = "gh-alert"
+version = "0.1.0"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-threadpool = "1.8"
-log = "0.4"
+clap              = { version = "4", features = ["derive"] }
+home              = "0.5"
+log               = "0.4"
+percent-encoding  = "2"
 pretty_env_logger = "0.5"
-home = "0.5.11"
+reqwest           = { version = "0.12", features = ["blocking", "json"] }
+serde             = { version = "1.0", features = ["derive"] }
+serde_json        = "1.0"
+threadpool        = "1.8"
