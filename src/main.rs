@@ -3,20 +3,19 @@ use home::home_dir;
 use log::{LevelFilter, debug, error, info, warn};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::blocking::Client;
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{env, fs, process, thread};
-// 注意：移除了 threadpool 依赖，因为它不再被需要。
 
-// 每分钟最多请求数
-const REQUESTS_PER_MINUTE: usize = 10;
-// GitHub API 的时间窗口（秒）
-const RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
+// --- 常量定义 ---
+// GitHub API 的速率限制窗口（秒）
+const QUERY_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -24,10 +23,6 @@ struct Args {
     /// The search terms to look for in GitHub code
     #[clap(num_args = 1..)]
     terms: Vec<String>,
-
-    /// The interval in seconds between each full search cycle.
-    #[arg(short, long, default_value_t = 120)]
-    interval: u64,
 
     /// Telegram bot token
     #[arg(long)]
@@ -38,9 +33,15 @@ struct Args {
     tg_user_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct GitHubSearchResult {
     total_count: u64,
+}
+
+// 定义一个包含结果和速率限制的结构体
+struct GitHubResponse {
+    count: u64,
+    ratelimit_remaining: Option<usize>,
 }
 
 trait Notifier {
@@ -69,7 +70,8 @@ impl Notifier for TelegramNotifier {
     }
 }
 
-fn search_github(client: &Client, term: &str) -> Result<u64, reqwest::Error> {
+// search_github 函数现在返回一个包含结果和剩余限额的 Result
+fn search_github(client: &Client, term: &str) -> Result<GitHubResponse, reqwest::Error> {
     let encoded_term = utf8_percent_encode(term, NON_ALPHANUMERIC).to_string();
     let url = format!("https://api.github.com/search/code?q={}", encoded_term);
     let mut rb = client.get(&url).header("User-Agent", "gh-alert");
@@ -77,20 +79,34 @@ fn search_github(client: &Client, term: &str) -> Result<u64, reqwest::Error> {
         rb = rb.bearer_auth(gh_token);
     }
     let response = rb.send()?;
-    debug!("GitHub search response: {:?}", response);
+    debug!(
+        "GitHub search response headers for term '{}': {:?}",
+        term,
+        response.headers()
+    );
 
-    // GitHub 的速率限制响应头通常包含在 Header 中
-    if let Some(limit) = response.headers().get("x-ratelimit-remaining") {
-        debug!("GitHub API ratelimit remaining: {:?}", limit);
+    // 从响应头解析 x-ratelimit-remaining
+    let ratelimit_remaining = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value: &HeaderValue| value.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+
+    if let Some(limit) = ratelimit_remaining {
+        debug!("GitHub API ratelimit remaining: {}", limit);
     }
 
-    Ok(response.json::<GitHubSearchResult>()?.total_count)
+    let search_result: GitHubSearchResult = response.json()?;
+    Ok(GitHubResponse {
+        count: search_result.total_count,
+        ratelimit_remaining,
+    })
 }
 
 static CACHE_FILE_PATH: Lazy<PathBuf> = Lazy::new(|| {
     home_dir()
         .map(|p| p.join(".cache"))
-        .unwrap_or(PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(format!("{}_previous.json", env!("CARGO_PKG_NAME")))
 });
 
@@ -103,24 +119,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // --- 新增：检查 interval 参数 ---
-    let at_least = args.terms.len() as u64 * RATE_LIMIT_WINDOW_SECONDS / REQUESTS_PER_MINUTE as u64;
-    if args.interval < at_least {
-        error!(
-            "Error: The interval must be at lease {} for {} terms to respect the GitHub rate limit when monitoring multiple terms.",
-            at_least,
-            args.terms.len()
-        );
+    if args.terms.is_empty() {
+        error!("Error: At least one search term must be provided.");
         process::exit(1);
     }
 
     let token = args
         .tg_token
-        .or(env::var("TELEGRAM_BOT_TOKEN").ok())
+        .or_else(|| env::var("TELEGRAM_BOT_TOKEN").ok())
         .expect("TELEGRAM_BOT_TOKEN must be set");
     let user_id = args
         .tg_user_id
-        .or(env::var("TELEGRAM_USER_ID").ok())
+        .or_else(|| env::var("TELEGRAM_USER_ID").ok())
         .expect("TELEGRAM_USER_ID must be set");
     let notifier: Arc<dyn Notifier + Send + Sync> = Arc::new(TelegramNotifier {
         token,
@@ -131,86 +141,142 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let previous_results = Arc::new(Mutex::new(load_previous_results(&*CACHE_FILE_PATH)));
     let client = Arc::new(Client::new());
 
+    // 1. 使用一个无限循环的 terms iter 来计算当前查询步骤
+    let mut terms_iter = args.terms.iter().map(|s| s.as_str()).cycle().peekable();
+
     loop {
-        let cycle_start_time = Instant::now();
-        info!(
-            "Starting a new search cycle for {} terms.",
-            args.terms.len()
-        );
+        info!("--- New query cycle started ---");
 
-        // 将所有 term 分块，每块的大小为 REQUESTS_PER_MINUTE
-        let chunks: Vec<_> = args.terms.chunks(REQUESTS_PER_MINUTE).collect();
-        let total_chunks = chunks.len();
+        // 3. 第一次 RTT: 只 peek iter 并发送一个查询
+        let rate_limit_remaining = if let Some(&peeked_term) = terms_iter.peek() {
+            info!("RTT 1: Peeking term '{}' to check rate limit.", peeked_term);
+            match search_github(&client, peeked_term) {
+                Ok(response) => {
+                    // 如果本次查询已经超出限额，就不消耗它
+                    let remaining = response.ratelimit_remaining.unwrap_or(0);
+                    if remaining == 0 {
+                        warn!(
+                            "Rate limit reached (0 remaining). Skipping this cycle to avoid consuming the term."
+                        );
+                        // 跳过 RTT 2, 直接进入休眠
+                        0
+                    } else {
+                        // 否则从 iter 里消耗这个 item (在 RTT 2 中完成)
+                        info!("Rate limit remaining: {}. Proceeding to RTT 2.", remaining);
+                        process_search_result(
+                            peeked_term,
+                            response.count,
+                            &previous_results,
+                            &notifier,
+                        );
+                        remaining
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "RTT 1 Error on peeked term '{}': {}. Skipping cycle.",
+                        peeked_term, e
+                    );
+                    0 // 发生错误，跳过本次周期
+                }
+            }
+        } else {
+            // 这不应该发生，因为 terms 不为空且是循环的
+            error!("Iterator is empty, which should not happen. Exiting.");
+            break;
+        };
 
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            info!("Processing chunk {}/{}...", i + 1, total_chunks);
-            for term in chunk {
+        // 如果限额 > 0, 执行 RTT 2
+        if rate_limit_remaining > 0 {
+            // 消耗掉 RTT 1 中 peek 过的 term
+            let _ = terms_iter.next();
+
+            // 3. 第二次 RTT: 根据 x-ratelimit-remaining 从 iter 中 take x-1 个 term
+            // 我们已经用掉了一个额度，所以是 remaining - 1
+            let terms_to_take = rate_limit_remaining.saturating_sub(1);
+            info!(
+                "RTT 2: Taking up to {} more terms from the iterator.",
+                terms_to_take
+            );
+
+            // 从迭代器中获取下一批要查询的词条，并确保消耗它们
+            let terms_batch: Vec<&str> = terms_iter.by_ref().take(terms_to_take).collect();
+
+            for term in terms_batch {
                 match search_github(&client, term) {
-                    Ok(current_count) => {
-                        let mut results = previous_results.lock().unwrap();
-                        let previous_count = results.get(term).cloned().unwrap_or(0);
-
-                        if previous_count != current_count {
-                            let message = format!(
-                                "GitHub search result for '{}' has changed from {} to {}.",
-                                term, previous_count, current_count
-                            );
-                            info!("{}", message);
-                            if let Err(e) = notifier.notify(&message) {
-                                error!("Failed to send notification: {}", e);
-                            }
-                            results.insert(term.to_string(), current_count);
-                            if let Err(e) = save_results(&*CACHE_FILE_PATH, &results) {
-                                error!("Failed to save results: {}", e);
-                            }
-                        } else {
-                            info!("No change for '{}', count remains {}.", term, current_count);
-                        }
+                    Ok(response) => {
+                        process_search_result(term, response.count, &previous_results, &notifier);
                     }
                     Err(e) => {
-                        // 如果请求失败，可能是因为达到了速率限制，打印错误并继续
-                        error!("Error searching for '{}': {}", term, e);
+                        // 对于所有错误，打出 error 日志
+                        error!("RTT 2 Error searching for '{}': {}", term, e);
                     }
                 }
             }
-
-            // 如果这不是最后一个块，就等待60秒，为下一批请求留出时间窗口
-            if i < total_chunks - 1 {
-                info!(
-                    "Finished chunk {}/{}. Waiting for {} seconds before next chunk...",
-                    i + 1,
-                    total_chunks,
-                    RATE_LIMIT_WINDOW_SECONDS
-                );
-                thread::sleep(Duration::from_secs(RATE_LIMIT_WINDOW_SECONDS));
-            }
         }
 
-        info!("Search cycle completed.");
+        // 2. 每隔一分钟进行一次查询
+        info!(
+            "Query cycle finished. Waiting for {} seconds.",
+            QUERY_INTERVAL_SECONDS
+        );
+        thread::sleep(Duration::from_secs(QUERY_INTERVAL_SECONDS));
+    }
 
-        // 计算整个周期花费的时间，并从用户设定的 interval 中减去，以实现精确的周期性执行
-        let elapsed = cycle_start_time.elapsed();
-        let interval_duration = Duration::from_secs(args.interval);
+    Ok(())
+}
 
-        if elapsed < interval_duration {
-            let sleep_duration = interval_duration - elapsed;
-            info!(
-                "Waiting for {:?} before starting the next cycle.",
-                sleep_duration
-            );
-            thread::sleep(sleep_duration);
+// 辅助函数，处理查询结果的比较、通知和保存逻辑
+fn process_search_result(
+    term: &str,
+    current_count: u64,
+    previous_results: &Arc<Mutex<HashMap<String, u64>>>,
+    notifier: &Arc<dyn Notifier + Send + Sync>,
+) {
+    let mut results = previous_results.lock().unwrap();
+    let previous_count = results.get(term).cloned().unwrap_or(0);
+
+    if previous_count != current_count {
+        let message = format!(
+            "GitHub search result for '{}' has changed from {} to {}.",
+            term, previous_count, current_count
+        );
+        info!("{}", message);
+        if let Err(e) = notifier.notify(&message) {
+            error!("Failed to send notification: {}", e);
         }
+        results.insert(term.to_string(), current_count);
+        if let Err(e) = save_results(&*CACHE_FILE_PATH, &results) {
+            error!("Failed to save results: {}", e);
+        }
+    } else {
+        info!("No change for '{}', count remains {}.", term, current_count);
     }
 }
 
 fn load_previous_results(file_path: impl AsRef<Path>) -> HashMap<String, u64> {
     if file_path.as_ref().exists() {
-        let mut file = fs::File::open(file_path).unwrap();
-        let mut contents = String::new();
-        file.read_to_string(&mut contents).unwrap();
-        serde_json::from_str(&contents).unwrap_or_default()
+        // 使用 unwrap_or_else 来处理文件读取或解析失败的情况
+        fs::File::open(&file_path)
+            .and_then(|mut file| {
+                let mut contents = String::new();
+                file.read_to_string(&mut contents)?;
+                Ok(contents)
+            })
+            .and_then(|contents| {
+                serde_json::from_str(&contents)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Failed to load or parse previous results from {:?}: {}. Starting fresh.",
+                    file_path.as_ref(),
+                    e
+                );
+                HashMap::new()
+            })
     } else {
-        warn!("No previous results found, starting from scratch.");
+        warn!("No previous results file found, starting from scratch.");
         HashMap::new()
     }
 }
@@ -219,6 +285,10 @@ fn save_results(
     file_path: impl AsRef<Path>,
     results: &HashMap<String, u64>,
 ) -> Result<(), std::io::Error> {
+    // 确保缓存目录存在
+    if let Some(parent) = file_path.as_ref().parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = fs::File::create(file_path)?;
     let contents = serde_json::to_string_pretty(results)?;
     file.write_all(contents.as_bytes())?;
@@ -234,41 +304,27 @@ mod tests {
     #[ignore = "requires env vars"]
     #[test]
     fn test_telegram_notifier_sends_message() {
-        // 从环境变量中读取 Telegram Bot Token 和 User ID
-        // 在运行测试前，你需要设置好这两个环境变量
-        // 例如: export TELEGRAM_BOT_TOKEN="your_token"
-        //       export TELEGRAM_USER_ID="your_user_id"
         let token =
             env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set for this test");
         let user_id =
             env::var("TELEGRAM_USER_ID").expect("TELEGRAM_USER_ID must be set for this test");
 
-        // 创建一个 reqwest 客户端实例
         let client = Client::new();
-
-        // 实例化 TelegramNotifier
         let notifier = TelegramNotifier {
             token,
             user_id,
             client,
         };
 
-        // 定义测试消息
         let test_message = "This is an automated test message from the Rust GitHub Alerter.";
-
-        // 调用 notify 方法并断言结果
         let result = notifier.notify(test_message);
 
-        // 检查 API 调用是否成功
-        // 如果 notify 方法返回 Err，测试将会失败并打印出错误信息
         assert!(
             result.is_ok(),
             "Failed to send Telegram notification: {:?}",
             result.err()
         );
 
-        // 如果程序执行到这里，说明消息已成功发送（HTTP请求已成功）
-        // 你应该在你的 Telegram 中检查是否收到了这条测试消息
         info!("Successfully sent test message to Telegram. Please check your client.");
     }
 }
