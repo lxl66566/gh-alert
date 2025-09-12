@@ -20,14 +20,17 @@
 `gh-alert <terms...> [--interval <SECONDS>] [--tg-token <TOKEN>] [--tg-user-id <ID>]`
 
 - `terms`: (必需) 要监控的一个或多个搜索关键词，用空格分隔。请将包含空格的关键词用引号括起来。
-- `--interval <SECONDS>`: (可选) 每次完整搜索周期的间隔时间（秒），默认为 `120`。
 - `--tg-token <TOKEN>`: (可选) 覆盖 `TELEGRAM_BOT_TOKEN` 环境变量。
 - `--tg-user-id <ID>`: (可选) 覆盖 `TELEGRAM_USER_ID` 环境变量。
 
 ### 示例
 
-监控两个关键词，每 300 秒（5 分钟）检查一次。
+监控两个关键词。
 
 ```bash
-gh-alert "proxy" "user:torvalds TODO" --interval 300
+gh-alert "proxy" "user:torvalds TODO"
 ```
+
+### 其他
+
+- 默认每分钟查询最多 10 个结果，以匹配 GitHub code search API 的 rate limit。

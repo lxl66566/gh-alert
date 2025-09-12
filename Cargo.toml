@@ -1,14 +1,22 @@
 [package]
 edition = "2024"
 name    = "gh-alert"
-version = "0.1.1"
+version = "0.2.0"
 
 [dependencies]
+async-trait       = "0.1.89"
 clap              = { version = "4", features = ["derive"] }
+futures           = "0.3.31"
 home              = "0.5"
 log               = "0.4"
-percent-encoding  = "2"
 pretty_env_logger = "0.5"
-reqwest           = { version = "0.12", features = ["blocking", "json"] }
+reqwest           = { version = "0.12", features = ["json"] }
 serde             = { version = "1.0", features = ["derive"] }
 serde_json        = "1.0"
+tokio             = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+lto       = true
+opt-level = "z"
+panic     = "abort"
+strip     = true

@@ -1,9 +1,7 @@
 use clap::Parser;
 use home::home_dir;
 use log::{LevelFilter, debug, error, info, warn};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::blocking::Client;
-use reqwest::header::HeaderValue;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -11,11 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{env, fs, process, thread};
+use std::{env, fs, process};
 
 // --- 常量定义 ---
 // GitHub API 的速率限制窗口（秒）
 const QUERY_INTERVAL_SECONDS: u64 = 60;
+
+static CACHE_FILE_PATH: Lazy<PathBuf> = Lazy::new(|| {
+    home_dir()
+        .map(|p| p.join(".cache"))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!("{}_previous.json", env!("CARGO_PKG_NAME")))
+});
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,8 +49,9 @@ struct GitHubResponse {
     ratelimit_remaining: Option<usize>,
 }
 
+#[async_trait::async_trait]
 trait Notifier {
-    fn notify(&self, message: &str) -> Result<(), Box<dyn std::error::Error>>;
+    async fn notify(&self, message: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 struct TelegramNotifier {
@@ -54,8 +60,12 @@ struct TelegramNotifier {
     client: Client,
 }
 
+#[async_trait::async_trait]
 impl Notifier for TelegramNotifier {
-    fn notify(&self, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn notify<'a, 'b>(
+        &'a self,
+        message: &'b str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let mut params = HashMap::new();
         params.insert("chat_id", self.user_id.clone());
@@ -65,52 +75,45 @@ impl Notifier for TelegramNotifier {
             .post(&url)
             .header("User-Agent", "gh-alert")
             .json(&params)
-            .send()?;
+            .send()
+            .await?;
         Ok(())
     }
 }
 
-// search_github 函数现在返回一个包含结果和剩余限额的 Result
-fn search_github(client: &Client, term: &str) -> Result<GitHubResponse, reqwest::Error> {
-    let encoded_term = utf8_percent_encode(term, NON_ALPHANUMERIC).to_string();
-    let url = format!("https://api.github.com/search/code?q={}", encoded_term);
-    let mut rb = client.get(&url).header("User-Agent", "gh-alert");
+async fn search_github(client: &Client, term: &str) -> Result<GitHubResponse, reqwest::Error> {
+    let mut rb = client
+        .get("https://api.github.com/search/code")
+        .header("User-Agent", "gh-alert")
+        .query(&[("q", term)]);
     if let Ok(gh_token) = env::var("GH_TOKEN") {
         rb = rb.bearer_auth(gh_token);
     }
-    let response = rb.send()?;
+    let response = rb.send().await?;
     debug!(
         "GitHub search response headers for term '{}': {:?}",
         term,
         response.headers()
     );
 
-    // 从响应头解析 x-ratelimit-remaining
     let ratelimit_remaining = response
         .headers()
         .get("x-ratelimit-remaining")
-        .and_then(|value: &HeaderValue| value.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok());
 
     if let Some(limit) = ratelimit_remaining {
         debug!("GitHub API ratelimit remaining: {}", limit);
     }
-
-    let search_result: GitHubSearchResult = response.json()?;
+    let search_result: GitHubSearchResult = response.json().await?;
     Ok(GitHubResponse {
         count: search_result.total_count,
         ratelimit_remaining,
     })
 }
 
-static CACHE_FILE_PATH: Lazy<PathBuf> = Lazy::new(|| {
-    home_dir()
-        .map(|p| p.join(".cache"))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(format!("{}_previous.json", env!("CARGO_PKG_NAME")))
-});
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     _ = pretty_env_logger::formatted_builder()
         .filter_level(LevelFilter::Info)
         .format_timestamp_secs()
@@ -143,32 +146,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. 使用一个无限循环的 terms iter 来计算当前查询步骤
     let mut terms_iter = args.terms.iter().map(|s| s.as_str()).cycle().peekable();
+    let total_terms = args.terms.len();
 
     loop {
         info!("--- New query cycle started ---");
 
-        // 3. 第一次 RTT: 只 peek iter 并发送一个查询
+        // RTT 1: Peek & Check
         let rate_limit_remaining = if let Some(&peeked_term) = terms_iter.peek() {
             info!("RTT 1: Peeking term '{}' to check rate limit.", peeked_term);
-            match search_github(&client, peeked_term) {
+            // 使用 .await 调用异步函数
+            match search_github(&client, peeked_term).await {
                 Ok(response) => {
-                    // 如果本次查询已经超出限额，就不消耗它
                     let remaining = response.ratelimit_remaining.unwrap_or(0);
                     if remaining == 0 {
-                        warn!(
-                            "Rate limit reached (0 remaining). Skipping this cycle to avoid consuming the term."
-                        );
-                        // 跳过 RTT 2, 直接进入休眠
+                        warn!("Rate limit reached (0 remaining). Skipping this cycle.");
                         0
                     } else {
-                        // 否则从 iter 里消耗这个 item (在 RTT 2 中完成)
                         info!("Rate limit remaining: {}. Proceeding to RTT 2.", remaining);
+                        // 调用异步处理函数
                         process_search_result(
                             peeked_term,
                             response.count,
                             &previous_results,
                             &notifier,
-                        );
+                        )
+                        .await;
                         remaining
                     }
                 }
@@ -177,80 +179,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "RTT 1 Error on peeked term '{}': {}. Skipping cycle.",
                         peeked_term, e
                     );
-                    0 // 发生错误，跳过本次周期
+                    0
                 }
             }
         } else {
-            // 这不应该发生，因为 terms 不为空且是循环的
             error!("Iterator is empty, which should not happen. Exiting.");
             break;
         };
 
-        // 如果限额 > 0, 执行 RTT 2
+        // RTT 2: Take & Consume Concurrently
         if rate_limit_remaining > 0 {
             // 消耗掉 RTT 1 中 peek 过的 term
             let _ = terms_iter.next();
 
-            // 3. 第二次 RTT: 根据 x-ratelimit-remaining 从 iter 中 take x-1 个 term
-            // 我们已经用掉了一个额度，所以是 remaining - 1
-            let terms_to_take = rate_limit_remaining.saturating_sub(1);
-            info!(
-                "RTT 2: Taking up to {} more terms from the iterator.",
-                terms_to_take
-            );
+            // 2. 请求数量是 min(remaining - 1, terms.len - 1)
+            let remaining_allowance = rate_limit_remaining.saturating_sub(1);
+            let remaining_terms_in_cycle = total_terms.saturating_sub(1);
+            let terms_to_take = remaining_allowance.min(remaining_terms_in_cycle);
 
-            // 从迭代器中获取下一批要查询的词条，并确保消耗它们
-            let terms_batch: Vec<&str> = terms_iter.by_ref().take(terms_to_take).collect();
+            if terms_to_take > 0 {
+                info!(
+                    "RTT 2: Concurrently taking up to {} more terms.",
+                    terms_to_take
+                );
 
-            for term in terms_batch {
-                match search_github(&client, term) {
-                    Ok(response) => {
-                        process_search_result(term, response.count, &previous_results, &notifier);
+                let terms_batch: Vec<&str> = terms_iter.by_ref().take(terms_to_take).collect();
+
+                // 创建一个 futures 向量
+                let futures = terms_batch.iter().map(|&term| {
+                    let client_clone = Arc::clone(&client);
+                    async move {
+                        // 将 term 和其查询结果关联起来
+                        (term, search_github(&client_clone, term).await)
                     }
-                    Err(e) => {
-                        // 对于所有错误，打出 error 日志
-                        error!("RTT 2 Error searching for '{}': {}", term, e);
+                });
+
+                // 1. 使用异步查询，同时发送请求
+                let results = futures::future::join_all(futures).await;
+
+                // 异步处理所有结果
+                for (term, result) in results {
+                    match result {
+                        Ok(response) => {
+                            process_search_result(
+                                term,
+                                response.count,
+                                &previous_results,
+                                &notifier,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!("RTT 2 Error searching for '{}': {}", term, e);
+                        }
                     }
                 }
+            } else {
+                info!("RTT 2: No more terms to take in this cycle or no rate limit left.");
             }
         }
 
-        // 2. 每隔一分钟进行一次查询
+        // 使用 tokio 的异步 sleep
         info!(
             "Query cycle finished. Waiting for {} seconds.",
             QUERY_INTERVAL_SECONDS
         );
-        thread::sleep(Duration::from_secs(QUERY_INTERVAL_SECONDS));
+        tokio::time::sleep(Duration::from_secs(QUERY_INTERVAL_SECONDS)).await;
     }
 
     Ok(())
 }
 
 // 辅助函数，处理查询结果的比较、通知和保存逻辑
-fn process_search_result(
+async fn process_search_result(
     term: &str,
     current_count: u64,
     previous_results: &Arc<Mutex<HashMap<String, u64>>>,
     notifier: &Arc<dyn Notifier + Send + Sync>,
 ) {
-    let mut results = previous_results.lock().unwrap();
-    let previous_count = results.get(term).cloned().unwrap_or(0);
+    // 将所有需要访问锁的操作都放在这个块中
+    let changed = {
+        let mut results = previous_results.lock().unwrap();
+        let previous_count = results.get(term).cloned().unwrap_or(0);
 
-    if previous_count != current_count {
+        if previous_count != current_count {
+            results.insert(term.to_string(), current_count);
+            if let Err(e) = save_results(&*CACHE_FILE_PATH, &results) {
+                error!("Failed to save results: {}", e);
+            }
+            Some(previous_count) // 返回 Some(previous_count) 表示发生了变化
+        } else {
+            info!("No change for '{}', count remains {}.", term, current_count);
+            None // 返回 None 表示没有变化
+        }
+    };
+    if let Some(previous_count) = changed {
         let message = format!(
             "GitHub search result for '{}' has changed from {} to {}.",
             term, previous_count, current_count
         );
         info!("{}", message);
-        if let Err(e) = notifier.notify(&message) {
+        if let Err(e) = notifier.notify(&message).await {
             error!("Failed to send notification: {}", e);
         }
-        results.insert(term.to_string(), current_count);
-        if let Err(e) = save_results(&*CACHE_FILE_PATH, &results) {
-            error!("Failed to save results: {}", e);
-        }
-    } else {
-        info!("No change for '{}', count remains {}.", term, current_count);
     }
 }
 
@@ -298,12 +329,12 @@ fn save_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::blocking::Client;
+    use reqwest::Client;
     use std::env;
 
     #[ignore = "requires env vars"]
-    #[test]
-    fn test_telegram_notifier_sends_message() {
+    #[tokio::test]
+    async fn test_telegram_notifier_sends_message() {
         let token =
             env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set for this test");
         let user_id =
@@ -317,7 +348,7 @@ mod tests {
         };
 
         let test_message = "This is an automated test message from the Rust GitHub Alerter.";
-        let result = notifier.notify(test_message);
+        let result = notifier.notify(test_message).await;
 
         assert!(
             result.is_ok(),
