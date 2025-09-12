@@ -8,12 +8,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use std::{env, fs};
-use threadpool::ThreadPool;
+use std::time::{Duration, Instant};
+use std::{env, fs, process, thread};
+// 注意：移除了 threadpool 依赖，因为它不再被需要。
 
-const THREAD_POOL_SIZE: usize = 10;
+// 每分钟最多请求数
+const REQUESTS_PER_MINUTE: usize = 10;
+// GitHub API 的时间窗口（秒）
+const RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -22,8 +24,8 @@ struct Args {
     #[clap(num_args = 1..)]
     terms: Vec<String>,
 
-    /// The interval in seconds between each search
-    #[arg(short, long, default_value_t = 60)]
+    /// The interval in seconds between each full search cycle.
+    #[arg(short, long, default_value_t = 120)]
     interval: u64,
 
     /// Telegram bot token
@@ -74,6 +76,12 @@ fn search_github(client: &Client, term: &str) -> Result<u64, reqwest::Error> {
     }
     let response = rb.send()?;
     debug!("GitHub search response: {:?}", response);
+
+    // GitHub 的速率限制响应头通常包含在 Header 中
+    if let Some(limit) = response.headers().get("x-ratelimit-remaining") {
+        debug!("GitHub API ratelimit remaining: {:?}", limit);
+    }
+
     Ok(response.json::<GitHubSearchResult>()?.total_count)
 }
 
@@ -92,6 +100,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .try_init();
 
     let args = Args::parse();
+
+    // --- 新增：检查 interval 参数 ---
+    let at_least = args.terms.len() as u64 * RATE_LIMIT_WINDOW_SECONDS / 10;
+    if args.interval < at_least {
+        error!(
+            "Error: The interval must be at lease {} for {} terms to respect the GitHub rate limit when monitoring multiple terms.",
+            at_least,
+            args.terms.len()
+        );
+        process::exit(1);
+    }
+
     let token = args
         .tg_token
         .or(env::var("TELEGRAM_BOT_TOKEN").ok())
@@ -107,22 +127,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let previous_results = Arc::new(Mutex::new(load_previous_results(&*CACHE_FILE_PATH)));
-
-    let pool = ThreadPool::new(THREAD_POOL_SIZE);
     let client = Arc::new(Client::new());
 
     loop {
-        let terms = args.terms.clone();
-        let client = Arc::clone(&client);
-        let notifier = Arc::clone(&notifier);
-        let previous_results = Arc::clone(&previous_results);
+        let cycle_start_time = Instant::now();
+        info!(
+            "Starting a new search cycle for {} terms.",
+            args.terms.len()
+        );
 
-        pool.execute(move || {
-            for term in terms {
-                match search_github(&client, &term) {
+        // 将所有 term 分块，每块的大小为 REQUESTS_PER_MINUTE
+        let chunks: Vec<_> = args.terms.chunks(REQUESTS_PER_MINUTE).collect();
+        let total_chunks = chunks.len();
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            info!("Processing chunk {}/{}...", i + 1, total_chunks);
+            for term in chunk {
+                match search_github(&client, term) {
                     Ok(current_count) => {
                         let mut results = previous_results.lock().unwrap();
-                        let previous_count = results.get(&term).cloned().unwrap_or(0);
+                        let previous_count = results.get(term).cloned().unwrap_or(0);
 
                         if previous_count != current_count {
                             let message = format!(
@@ -133,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = notifier.notify(&message) {
                                 error!("Failed to send notification: {}", e);
                             }
-                            results.insert(term.clone(), current_count);
+                            results.insert(term.to_string(), current_count);
                             if let Err(e) = save_results(&*CACHE_FILE_PATH, &results) {
                                 error!("Failed to save results: {}", e);
                             }
@@ -142,13 +166,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
+                        // 如果请求失败，可能是因为达到了速率限制，打印错误并继续
                         error!("Error searching for '{}': {}", term, e);
                     }
                 }
             }
-        });
 
-        thread::sleep(Duration::from_secs(args.interval));
+            // 如果这不是最后一个块，就等待60秒，为下一批请求留出时间窗口
+            if i < total_chunks - 1 {
+                info!(
+                    "Finished chunk {}/{}. Waiting for {} seconds before next chunk...",
+                    i + 1,
+                    total_chunks,
+                    RATE_LIMIT_WINDOW_SECONDS
+                );
+                thread::sleep(Duration::from_secs(RATE_LIMIT_WINDOW_SECONDS));
+            }
+        }
+
+        info!("Search cycle completed.");
+
+        // 计算整个周期花费的时间，并从用户设定的 interval 中减去，以实现精确的周期性执行
+        let elapsed = cycle_start_time.elapsed();
+        let interval_duration = Duration::from_secs(args.interval);
+
+        if elapsed < interval_duration {
+            let sleep_duration = interval_duration - elapsed;
+            info!(
+                "Waiting for {:?} before starting the next cycle.",
+                sleep_duration
+            );
+            thread::sleep(sleep_duration);
+        }
     }
 }
 
