@@ -1,36 +1,65 @@
 # gh-alert
 
-`gh-alert` 用于持续监控 GitHub 上的代码搜索结果，并在结果数量发生变化时通过 Telegram 发送通知。
+`gh-alert` 持续监控 GitHub 代码搜索结果，当结果数量变化时通过 Telegram 发送通知。
 
-- **关键词监控**：支持监控多个 GitHub 代码搜索关键词。
-- **变更告警**：当搜索结果总数发生变化时，通过 Telegram Bot 发送实时告警信息。
-- **尊重 API 限制**：内置速率控制机制，将请求分批发送，确保每分钟不超过 GitHub API 的 10 次限制。
-- **状态持久化**：将上一次的搜索结果保存在本地，即使程序重启也能进行正确的比较。
+- **关键词监控**：支持同时监控多个 GitHub 代码搜索关键词。
+- **变更告警**：当搜索结果总数发生变化时，通过 Telegram Bot 实时推送。
+- **认证灵活**：优先读取 `GH_TOKEN`，找不到时自动回退到 `gh auth token`（GitHub CLI）。
+- **尊重速率限制**：根据 `x-ratelimit-remaining` / `x-ratelimit-reset` 动态调整下一次查询的时间。
+- **状态持久化**：结果缓存在本地（原子写入），重启后可正确比较。
+
+## 认证
+
+GitHub code search 必须认证，按以下顺序解析 token：
+
+1. 环境变量 **`GH_TOKEN`**
+2. `gh auth token`（需安装并登录 [GitHub CLI](https://cli.github.com/)，执行 `gh auth login`）
+
+二者任选其一即可。
 
 ## 使用方法
 
-需要设置以下环境变量：
+### 环境变量
 
-- **`GH_TOKEN`**: GitHub Personal Access Token，对于 code search 是必须的。
-- **`TELEGRAM_BOT_TOKEN`**: 你的 Telegram Bot 的 Token。
-- **`TELEGRAM_USER_ID`**: 接收通知的用户的 Chat ID。
+| 变量 | 说明 |
+| --- | --- |
+| `GH_TOKEN` | （可选）GitHub PAT，未设置时回退到 `gh auth token`。 |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token。 |
+| `TELEGRAM_USER_ID` | 接收通知的 Chat ID。 |
+| `RUST_LOG` | 日志级别，如 `debug`。 |
 
-命令行：
+### 命令行
 
-`gh-alert <terms...> [--interval <SECONDS>] [--tg-token <TOKEN>] [--tg-user-id <ID>]`
+```
+gh-alert [OPTIONS] <TERMS>...
+```
 
-- `terms`: (必需) 要监控的一个或多个搜索关键词，用空格分隔。请将包含空格的关键词用引号括起来。
-- `--tg-token <TOKEN>`: (可选) 覆盖 `TELEGRAM_BOT_TOKEN` 环境变量。
-- `--tg-user-id <ID>`: (可选) 覆盖 `TELEGRAM_USER_ID` 环境变量。
+**参数：**
+
+- `<TERMS>...`：要监控的搜索关键词（至少一个）。
+
+**选项：**
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `-i, --interval <SECS>` | `60` | 两次查询循环之间的间隔（秒）。 |
+| `--once` | — | 只跑一轮，完成后退出。 |
+| `--tg-token <TOKEN>` | — | 覆盖 `TELEGRAM_BOT_TOKEN`（**注意：会暴露在进程列表中**）。 |
+| `--tg-user-id <ID>` | — | 覆盖 `TELEGRAM_USER_ID`。 |
+| `-h, --help` | — | 帮助。 |
+| `-V, --version` | — | 版本。 |
+
+> 安全提示：通过 `--tg-token` 传递的密钥会被其他用户通过 `ps` 等方式看到，建议优先使用环境变量。
 
 ### 示例
 
-监控两个关键词。
-
 ```bash
+# 持续监控（默认 60 秒一轮）
 gh-alert "proxy" "user:torvalds TODO"
+
+# 只跑一轮（适合 cron / 定时任务）
+gh-alert --once "proxy"
+
+# 自定义间隔
+gh-alert --interval 120 "proxy"
 ```
-
-### 其他
-
-- 默认每分钟查询最多 10 个结果，以匹配 GitHub code search API 的 rate limit。

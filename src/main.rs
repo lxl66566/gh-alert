@@ -1,120 +1,73 @@
+mod cache;
+mod github;
+mod notifier;
+
+use std::{
+    path::PathBuf,
+    sync::LazyLock,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::Context;
+use cache::Results;
 use clap::Parser;
-use home::home_dir;
+use futures_util::stream::{self, StreamExt};
+use github::{GitHubClient, SearchOutcome};
 use log::{LevelFilter, debug, error, info, warn};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock as Lazy;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::{env, fs, process};
 
-// --- 常量定义 ---
-// GitHub API 的速率限制窗口（秒）
-const QUERY_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_INTERVAL_SECS: u64 = 60;
+const CONCURRENCY: usize = 5;
+const HTTP_TIMEOUT_SECS: u64 = 30;
 
-static CACHE_FILE_PATH: Lazy<PathBuf> = Lazy::new(|| {
-    home_dir()
-        .map(|p| p.join(".cache"))
+static CACHE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+    dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(format!("{}_previous.json", env!("CARGO_PKG_NAME")))
+        .join("gh-alert")
+        .join("previous.json")
 });
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// The search terms to look for in GitHub code
-    #[clap(num_args = 1..)]
+    /// Search terms to monitor on GitHub code search.
+    #[arg(num_args = 1..)]
     terms: Vec<String>,
 
-    /// Telegram bot token
+    /// Seconds to wait between query cycles.
+    #[arg(short, long, default_value_t = DEFAULT_INTERVAL_SECS)]
+    interval: u64,
+
+    /// Run a single cycle then exit.
+    #[arg(long)]
+    once: bool,
+
+    /// Telegram bot token (overrides `TELEGRAM_BOT_TOKEN`).
+    ///
+    /// Note: passing secrets via the command line exposes them in the process
+    /// list. Prefer the `TELEGRAM_BOT_TOKEN` environment variable.
     #[arg(long)]
     tg_token: Option<String>,
 
-    /// Telegram destination user ID
+    /// Telegram destination user/chat ID (overrides `TELEGRAM_USER_ID`).
     #[arg(long)]
     tg_user_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct GitHubSearchResult {
-    total_count: u64,
+struct SearchAttempt {
+    term: String,
+    result: anyhow::Result<SearchOutcome>,
 }
 
-// 定义一个包含结果和速率限制的结构体
-struct GitHubResponse {
-    count: u64,
-    ratelimit_remaining: Option<usize>,
-}
-
-#[async_trait::async_trait]
-trait Notifier {
-    async fn notify(&self, message: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
-struct TelegramNotifier {
-    token: String,
-    user_id: String,
-    client: Client,
-}
-
-#[async_trait::async_trait]
-impl Notifier for TelegramNotifier {
-    async fn notify<'a, 'b>(
-        &'a self,
-        message: &'b str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        let mut params = HashMap::new();
-        params.insert("chat_id", self.user_id.clone());
-        params.insert("text", message.to_string());
-
-        self.client
-            .post(&url)
-            .header("User-Agent", "gh-alert")
-            .json(&params)
-            .send()
-            .await?;
-        Ok(())
-    }
-}
-
-async fn search_github(client: &Client, term: &str) -> Result<GitHubResponse, reqwest::Error> {
-    let mut rb = client
-        .get("https://api.github.com/search/code")
-        .header("User-Agent", "gh-alert")
-        .query(&[("q", term)]);
-    if let Ok(gh_token) = env::var("GH_TOKEN") {
-        rb = rb.bearer_auth(gh_token);
-    }
-    let response = rb.send().await?;
-    debug!(
-        "GitHub search response headers for term '{}': {:?}",
-        term,
-        response.headers()
-    );
-
-    let ratelimit_remaining = response
-        .headers()
-        .get("x-ratelimit-remaining")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok());
-
-    if let Some(limit) = ratelimit_remaining {
-        debug!("GitHub API ratelimit remaining: {}", limit);
-    }
-    let search_result: GitHubSearchResult = response.json().await?;
-    Ok(GitHubResponse {
-        count: search_result.total_count,
-        ratelimit_remaining,
-    })
+struct Change {
+    term: String,
+    previous: u64,
+    current: u64,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    _ = pretty_env_logger::formatted_builder()
+async fn main() -> anyhow::Result<()> {
+    let _ = pretty_env_logger::formatted_builder()
         .filter_level(LevelFilter::Info)
         .format_timestamp_secs()
         .parse_default_env()
@@ -122,240 +75,214 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    if args.terms.is_empty() {
-        error!("Error: At least one search term must be provided.");
-        process::exit(1);
+    let http_client = Client::builder()
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let gh_token = github::resolve_token();
+    if gh_token.is_none() {
+        warn!(
+            "No GitHub token found. Set GH_TOKEN or run `gh auth login`. \
+             Unauthenticated code search is heavily rate-limited and may fail."
+        );
     }
+    let gh_client = GitHubClient::new(http_client.clone(), gh_token);
 
-    let token = args
+    let tg_token = args
         .tg_token
-        .or_else(|| env::var("TELEGRAM_BOT_TOKEN").ok())
-        .expect("TELEGRAM_BOT_TOKEN must be set");
-    let user_id = args
+        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok())
+        .filter(|s| !s.is_empty())
+        .context("TELEGRAM_BOT_TOKEN is required (set the env var or pass --tg-token)")?;
+    let tg_user_id = args
         .tg_user_id
-        .or_else(|| env::var("TELEGRAM_USER_ID").ok())
-        .expect("TELEGRAM_USER_ID must be set");
-    let notifier: Arc<dyn Notifier + Send + Sync> = Arc::new(TelegramNotifier {
-        token,
-        user_id,
-        client: Client::new(),
-    });
+        .or_else(|| std::env::var("TELEGRAM_USER_ID").ok())
+        .filter(|s| !s.is_empty())
+        .context("TELEGRAM_USER_ID is required (set the env var or pass --tg-user-id)")?;
 
-    let previous_results = Arc::new(Mutex::new(load_previous_results(&*CACHE_FILE_PATH)));
-    let client = Arc::new(Client::new());
+    let notifier = notifier::TelegramNotifier::new(tg_token, tg_user_id, http_client);
 
-    // 1. 使用一个无限循环的 terms iter 来计算当前查询步骤
-    let mut terms_iter = args.terms.iter().map(|s| s.as_str()).cycle().peekable();
-    let total_terms = args.terms.len();
+    let mut results = cache::load(&CACHE_PATH);
+
+    run_loop(
+        &gh_client,
+        &notifier,
+        &args.terms,
+        args.interval,
+        args.once,
+        &mut results,
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn run_loop(
+    gh_client: &GitHubClient,
+    notifier: &notifier::TelegramNotifier,
+    terms: &[String],
+    interval_secs: u64,
+    once: bool,
+    results: &mut Results,
+) {
+    let interval = Duration::from_secs(interval_secs);
 
     loop {
-        info!("--- New query cycle started ---");
+        info!("--- Query cycle: {} term(s) ---", terms.len());
 
-        // RTT 1: Peek & Check
-        let rate_limit_remaining = if let Some(&peeked_term) = terms_iter.peek() {
-            info!("RTT 1: Peeking term '{}' to check rate limit.", peeked_term);
-            // 使用 .await 调用异步函数
-            match search_github(&client, peeked_term).await {
-                Ok(response) => {
-                    let remaining = response.ratelimit_remaining.unwrap_or(0);
-                    if remaining == 0 {
-                        warn!("Rate limit reached (0 remaining). Skipping this cycle.");
-                        0
-                    } else {
-                        info!("Rate limit remaining: {}. Proceeding to RTT 2.", remaining);
-                        // 调用异步处理函数
-                        process_search_result(
-                            peeked_term,
-                            response.count,
-                            &previous_results,
-                            &notifier,
-                        )
-                        .await;
-                        remaining
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "RTT 1 Error on peeked term '{}': {}. Skipping cycle.",
-                        peeked_term, e
-                    );
-                    0
-                }
+        let attempts = search_all(gh_client, terms).await;
+        let changes = process_changes(&attempts, results);
+        notify_changes(notifier, &changes).await;
+
+        if !changes.is_empty() {
+            if let Err(e) = cache::save(&CACHE_PATH, results) {
+                error!("Failed to save cache: {e:#}");
             }
-        } else {
-            error!("Iterator is empty, which should not happen. Exiting.");
+        }
+
+        if once {
+            info!("--once: exiting after a single cycle.");
             break;
-        };
+        }
 
-        // RTT 2: Take & Consume Concurrently
-        if rate_limit_remaining > 0 {
-            // 消耗掉 RTT 1 中 peek 过的 term
-            let _ = terms_iter.next();
+        let sleep_dur = compute_sleep(&attempts, interval);
+        info!("Next cycle in {sleep_dur:?}.");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Interrupt received, shutting down.");
+                break;
+            }
+            () = tokio::time::sleep(sleep_dur) => {}
+        }
+    }
+}
 
-            // 2. 请求数量是 min(remaining - 1, terms.len - 1)
-            let remaining_allowance = rate_limit_remaining.saturating_sub(1);
-            let remaining_terms_in_cycle = total_terms.saturating_sub(1);
-            let terms_to_take = remaining_allowance.min(remaining_terms_in_cycle);
+/// Queries all terms concurrently (bounded by [`CONCURRENCY`]).
+async fn search_all(client: &GitHubClient, terms: &[String]) -> Vec<SearchAttempt> {
+    stream::iter(terms.iter().cloned())
+        .map(|term| async move {
+            let result = client.search(&term).await;
+            SearchAttempt { term, result }
+        })
+        .buffer_unordered(CONCURRENCY)
+        .collect()
+        .await
+}
 
-            if terms_to_take > 0 {
-                info!(
-                    "RTT 2: Concurrently taking up to {} more terms.",
-                    terms_to_take
-                );
-
-                let terms_batch: Vec<&str> = terms_iter.by_ref().take(terms_to_take).collect();
-
-                // 创建一个 futures 向量
-                let futures = terms_batch.iter().map(|&term| {
-                    let client_clone = Arc::clone(&client);
-                    async move {
-                        // 将 term 和其查询结果关联起来
-                        (term, search_github(&client_clone, term).await)
-                    }
-                });
-
-                // 1. 使用异步查询，同时发送请求
-                let results = futures::future::join_all(futures).await;
-
-                // 异步处理所有结果
-                for (term, result) in results {
-                    match result {
-                        Ok(response) => {
-                            process_search_result(
-                                term,
-                                response.count,
-                                &previous_results,
-                                &notifier,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            error!("RTT 2 Error searching for '{}': {}", term, e);
-                        }
-                    }
+/// Compares each result against the cache, updating it and collecting changes.
+fn process_changes(attempts: &[SearchAttempt], results: &mut Results) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for attempt in attempts {
+        let term = attempt.term.as_str();
+        match &attempt.result {
+            Ok(outcome) => {
+                let previous = results.get(term).copied().unwrap_or(0);
+                if previous == outcome.count {
+                    debug!("'{term}': still {previous} (no change)");
+                } else {
+                    results.insert(term.to_string(), outcome.count);
+                    info!("'{term}': {previous} -> {} (changed)", outcome.count);
+                    changes.push(Change {
+                        term: term.to_string(),
+                        previous,
+                        current: outcome.count,
+                    });
                 }
-            } else {
-                info!("RTT 2: No more terms to take in this cycle or no rate limit left.");
+            }
+            Err(e) => {
+                error!("Search for '{term}' failed: {e:#}");
             }
         }
-
-        // 使用 tokio 的异步 sleep
-        info!(
-            "Query cycle finished. Waiting for {} seconds.",
-            QUERY_INTERVAL_SECONDS
-        );
-        tokio::time::sleep(Duration::from_secs(QUERY_INTERVAL_SECONDS)).await;
     }
-
-    Ok(())
+    changes
 }
 
-// 辅助函数，处理查询结果的比较、通知和保存逻辑
-async fn process_search_result(
-    term: &str,
-    current_count: u64,
-    previous_results: &Arc<Mutex<HashMap<String, u64>>>,
-    notifier: &Arc<dyn Notifier + Send + Sync>,
-) {
-    // 将所有需要访问锁的操作都放在这个块中
-    let changed = {
-        let mut results = previous_results.lock().unwrap();
-        let previous_count = results.get(term).cloned().unwrap_or(0);
-
-        if previous_count != current_count {
-            results.insert(term.to_string(), current_count);
-            if let Err(e) = save_results(&*CACHE_FILE_PATH, &results) {
-                error!("Failed to save results: {}", e);
-            }
-            Some(previous_count) // 返回 Some(previous_count) 表示发生了变化
-        } else {
-            info!("No change for '{}', count remains {}.", term, current_count);
-            None // 返回 None 表示没有变化
-        }
-    };
-    if let Some(previous_count) = changed {
+async fn notify_changes(notifier: &notifier::TelegramNotifier, changes: &[Change]) {
+    for change in changes {
         let message = format!(
-            "GitHub search result for '{}' has changed from {} to {}.",
-            term, previous_count, current_count
+            "GitHub search for '{}' changed: {} -> {}.",
+            change.term, change.previous, change.current
         );
-        info!("{}", message);
+        info!("{message}");
         if let Err(e) = notifier.notify(&message).await {
-            error!("Failed to send notification: {}", e);
+            error!("Telegram notification failed: {e:#}");
         }
     }
 }
 
-fn load_previous_results(file_path: impl AsRef<Path>) -> HashMap<String, u64> {
-    if file_path.as_ref().exists() {
-        // 使用 unwrap_or_else 来处理文件读取或解析失败的情况
-        fs::File::open(&file_path)
-            .and_then(|mut file| {
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)?;
-                Ok(contents)
-            })
-            .and_then(|contents| {
-                serde_json::from_str(&contents)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })
-            .unwrap_or_else(|e| {
-                warn!(
-                    "Failed to load or parse previous results from {:?}: {}. Starting fresh.",
-                    file_path.as_ref(),
-                    e
-                );
-                HashMap::new()
-            })
-    } else {
-        warn!("No previous results file found, starting from scratch.");
-        HashMap::new()
-    }
-}
+/// If any response indicates the rate-limit budget is exhausted, sleeps until
+/// the reset time reported by GitHub; otherwise returns `default`.
+fn compute_sleep(attempts: &[SearchAttempt], default: Duration) -> Duration {
+    let furthest_reset = attempts
+        .iter()
+        .filter_map(|a| a.result.as_ref().ok())
+        .filter(|o| o.ratelimit.remaining == Some(0))
+        .filter_map(|o| o.ratelimit.reset_at)
+        .max();
 
-fn save_results(
-    file_path: impl AsRef<Path>,
-    results: &HashMap<String, u64>,
-) -> Result<(), std::io::Error> {
-    // 确保缓存目录存在
-    if let Some(parent) = file_path.as_ref().parent() {
-        fs::create_dir_all(parent)?;
+    match furthest_reset {
+        Some(reset) => reset
+            .duration_since(SystemTime::now())
+            .map(|d| d + Duration::from_secs(1))
+            .unwrap_or(default),
+        None => default,
     }
-    let mut file = fs::File::create(file_path)?;
-    let contents = serde_json::to_string_pretty(results)?;
-    file.write_all(contents.as_bytes())?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use github::RateLimit;
+
     use super::*;
-    use reqwest::Client;
-    use std::env;
 
-    #[ignore = "requires env vars"]
-    #[tokio::test]
-    async fn test_telegram_notifier_sends_message() {
-        let token =
-            env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set for this test");
-        let user_id =
-            env::var("TELEGRAM_USER_ID").expect("TELEGRAM_USER_ID must be set for this test");
+    fn attempt(remaining: Option<u32>, reset_at: Option<SystemTime>) -> SearchAttempt {
+        SearchAttempt {
+            term: "test".to_string(),
+            result: Ok(SearchOutcome {
+                count: 0,
+                ratelimit: RateLimit {
+                    remaining,
+                    reset_at,
+                },
+            }),
+        }
+    }
 
-        let client = Client::new();
-        let notifier = TelegramNotifier {
-            token,
-            user_id,
-            client,
-        };
-
-        let test_message = "This is an automated test message from the Rust GitHub Alerter.";
-        let result = notifier.notify(test_message).await;
-
-        assert!(
-            result.is_ok(),
-            "Failed to send Telegram notification: {:?}",
-            result.err()
+    #[test]
+    fn compute_sleep_default_when_no_data() {
+        let attempts = vec![attempt(None, None)];
+        assert_eq!(
+            compute_sleep(&attempts, Duration::from_secs(60)),
+            Duration::from_secs(60)
         );
+    }
 
-        info!("Successfully sent test message to Telegram. Please check your client.");
+    #[test]
+    fn compute_sleep_default_when_budget_left() {
+        let attempts = vec![attempt(Some(5), None)];
+        assert_eq!(
+            compute_sleep(&attempts, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn compute_sleep_waits_until_reset_when_exhausted() {
+        let reset = UNIX_EPOCH
+            + Duration::from_secs(
+                (SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs())
+                    + 10,
+            );
+        let attempts = vec![attempt(Some(0), Some(reset))];
+
+        let sleep = compute_sleep(&attempts, Duration::from_secs(60));
+
+        assert!(sleep >= Duration::from_secs(8));
+        assert!(sleep <= Duration::from_secs(12));
     }
 }
